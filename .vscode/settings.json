@@ -1,0 +1,13 @@
+{
+    "files.exclude": {
+      "build": true
+    },
+    "git.ignoreLimitWarning": true,
+    "editor.formatOnSave": true,
+    "editor.lineHeight": 1.4,
+    "editor.scrollBeyondLastLine": false,
+    "rust-analyzer.linkedProjects": [
+      ".Cargo.toml",
+    ],
+  }
+  
