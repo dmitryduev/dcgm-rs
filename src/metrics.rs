@@ -1,9 +1,10 @@
 use crate::dcgm_types::{
     is_fp64_blank, is_int64_blank, DcgmFieldValue, DCGM_FE_GPU, DCGM_FI_DEV_POWER_USAGE,
-    DCGM_FI_PROF_SM_ACTIVE, DCGM_FT_DOUBLE, DCGM_FT_INT64,
+    DCGM_FI_PROF_SM_ACTIVE, DCGM_FT_DOUBLE, DCGM_FT_INT64, DCGM_FV_FLAG_LIVE_DATA,
 };
 use crate::{DcgmError, DcgmHandle, Result};
 use libloading::Symbol;
+use std::ffi::CString;
 
 /// A struct representing the power usage of a GPU
 #[derive(Debug, Clone, Copy)]
@@ -23,8 +24,16 @@ pub struct SmActivity {
 
 impl DcgmHandle {
     /// Get the latest power usage for a specific GPU
-    pub fn get_power_usage(&self, device_id: u32) -> Result<PowerUsage> {
-        let field_values = self.get_device_field_values(device_id, &[DCGM_FI_DEV_POWER_USAGE])?;
+    pub fn get_power_usage(&mut self, device_id: u32) -> Result<PowerUsage> {
+        // Ensure power metrics are being watched
+        self.enable_power_metrics()?;
+
+        // Force an update to get the latest values
+        self.update_all_fields(true)?;
+
+        // Get the field values with the LIVE flag to ensure we get the current data
+        let field_values =
+            self.get_device_field_values(device_id, &[DCGM_FI_DEV_POWER_USAGE], true)?;
 
         if field_values.is_empty() {
             return Err(DcgmError::FieldValueError(
@@ -49,8 +58,16 @@ impl DcgmHandle {
     }
 
     /// Get the latest SM activity for a specific GPU
-    pub fn get_sm_activity(&self, device_id: u32) -> Result<SmActivity> {
-        let field_values = self.get_device_field_values(device_id, &[DCGM_FI_PROF_SM_ACTIVE])?;
+    pub fn get_sm_activity(&mut self, device_id: u32) -> Result<SmActivity> {
+        // Ensure profiling metrics are being watched
+        self.enable_profiling_metrics()?;
+
+        // Force an update to get the latest values
+        self.update_all_fields(true)?;
+
+        // Get the field values with the LIVE flag to ensure we get the current data
+        let field_values =
+            self.get_device_field_values(device_id, &[DCGM_FI_PROF_SM_ACTIVE], true)?;
 
         if field_values.is_empty() {
             return Err(DcgmError::FieldValueError(
@@ -75,10 +92,19 @@ impl DcgmHandle {
     }
 
     /// Get both power usage and SM activity metrics for a specific GPU
-    pub fn get_metrics(&self, device_id: u32) -> Result<(PowerUsage, SmActivity)> {
+    pub fn get_metrics(&mut self, device_id: u32) -> Result<(PowerUsage, SmActivity)> {
+        // Ensure both metrics are being watched
+        self.enable_power_metrics()?;
+        self.enable_profiling_metrics()?;
+
+        // Force an update to get the latest values
+        self.update_all_fields(true)?;
+
+        // Get the field values with the LIVE flag to ensure we get the current data
         let field_values = self.get_device_field_values(
             device_id,
             &[DCGM_FI_DEV_POWER_USAGE, DCGM_FI_PROF_SM_ACTIVE],
+            true,
         )?;
 
         if field_values.len() < 2 {
@@ -135,6 +161,7 @@ impl DcgmHandle {
         &self,
         device_id: u32,
         field_ids: &[u16],
+        use_live_data: bool,
     ) -> Result<Vec<DcgmFieldValue>> {
         let dcgm_entities_get_latest_values: Symbol<
             unsafe extern "C" fn(
@@ -154,9 +181,17 @@ impl DcgmHandle {
         };
 
         let field_count = field_ids.len() as u32;
-        let mut values: Vec<DcgmFieldValue> = (0..field_count as usize)
-            .map(|_| Default::default())
-            .collect();
+        let mut values: Vec<DcgmFieldValue> = Vec::with_capacity(field_count as usize);
+        for _ in 0..field_count {
+            values.push(DcgmFieldValue::default());
+        }
+
+        // Flag to request live data if needed
+        let flags: u32 = if use_live_data {
+            DCGM_FV_FLAG_LIVE_DATA
+        } else {
+            0
+        };
 
         let result = unsafe {
             dcgm_entities_get_latest_values(
@@ -165,7 +200,7 @@ impl DcgmHandle {
                 1,
                 field_ids.as_ptr(),
                 field_count,
-                0, // Flags: 0 = use cached value
+                flags,
                 values.as_mut_ptr(),
             )
         };

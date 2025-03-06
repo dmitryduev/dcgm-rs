@@ -14,6 +14,9 @@ pub const DCGM_INT32_BLANK: i32 = 0x7ffffff0;
 pub const DCGM_INT64_BLANK: i64 = 0x7ffffffffffffff0;
 pub const DCGM_FP64_BLANK: f64 = 140737488355328.0;
 
+// Flags for dcgmEntitiesGetLatestValues
+pub const DCGM_FV_FLAG_LIVE_DATA: u32 = 0x00000001;
+
 // Used to check if a value is blank
 #[inline]
 pub fn is_int64_blank(val: i64) -> bool {
