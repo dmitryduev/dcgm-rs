@@ -1,5 +1,8 @@
 use libloading::{Library, Symbol};
-use std::{ffi::CString, ptr, time::Duration};
+use std::{
+    ffi::{c_char, CString},
+    ptr,
+};
 use thiserror::Error;
 
 pub mod dcgm_types;
@@ -12,9 +15,6 @@ pub enum DcgmError {
 
     #[error("DCGM API returned error: {0} ({1})")]
     ApiError(i32, String),
-
-    #[error("Failed to initialize DCGM")]
-    InitializationError,
 
     #[error("Invalid handle")]
     InvalidHandle,
@@ -34,16 +34,11 @@ pub type Result<T> = std::result::Result<T, DcgmError>;
 pub struct DcgmHandle {
     handle: u64,
     lib: Library,
-    // Track whether we've enabled watches for power and profiling metrics
-    power_watched: bool,
-    prof_watched: bool,
-    power_group_id: u64,
-    prof_group_id: u64,
 }
 
 impl DcgmHandle {
     pub fn new() -> Result<Self> {
-        let lib = unsafe { Library::new("libdcgm.so") }?;
+        let lib = unsafe { Library::new("libdcgm.so.4") }?;
 
         let dcgm_init: Symbol<unsafe extern "C" fn() -> i32> = unsafe { lib.get(b"dcgmInit")? };
 
@@ -65,7 +60,7 @@ impl DcgmHandle {
             ));
         }
 
-        // Update all fields initially to make sure we're getting fresh data
+        // Update all fields immediately
         let dcgm_update_all_fields: Symbol<unsafe extern "C" fn(u64, i32) -> i32> =
             unsafe { lib.get(b"dcgmUpdateAllFields")? };
 
@@ -74,18 +69,11 @@ impl DcgmHandle {
             eprintln!("Warning: dcgmUpdateAllFields failed with code {}", result);
         }
 
-        Ok(DcgmHandle {
-            handle,
-            lib,
-            power_watched: false,
-            prof_watched: false,
-            power_group_id: 0,
-            prof_group_id: 0,
-        })
+        Ok(DcgmHandle { handle, lib })
     }
 
     pub fn with_connection(hostname: &str, port: Option<u16>) -> Result<Self> {
-        let lib = unsafe { Library::new("libdcgm.so") }?;
+        let lib = unsafe { Library::new("libdcgm.so.4") }?;
 
         let dcgm_init: Symbol<unsafe extern "C" fn() -> i32> = unsafe { lib.get(b"dcgmInit")? };
 
@@ -110,120 +98,7 @@ impl DcgmHandle {
             return Err(DcgmError::ConnectionFailed);
         }
 
-        // Update all fields initially to make sure we're getting fresh data
-        let dcgm_update_all_fields: Symbol<unsafe extern "C" fn(u64, i32) -> i32> =
-            unsafe { lib.get(b"dcgmUpdateAllFields")? };
-
-        let result = unsafe { dcgm_update_all_fields(handle, 1) }; // Wait for update
-        if result != 0 {
-            eprintln!("Warning: dcgmUpdateAllFields failed with code {}", result);
-        }
-
-        Ok(DcgmHandle {
-            handle,
-            lib,
-            power_watched: false,
-            prof_watched: false,
-            power_group_id: 0,
-            prof_group_id: 0,
-        })
-    }
-
-    // Enable watching specific metrics for all GPUs
-    pub fn enable_power_metrics(&mut self) -> Result<()> {
-        if self.power_watched {
-            return Ok(());
-        }
-
-        // Just use the field directly through dcgmEntitiesGetLatestValues
-        // This avoids the field group creation which might be causing issues
-        self.power_watched = true;
-        Ok(())
-    }
-
-    // Enable watching profiling metrics (including SM activity)
-    pub fn enable_profiling_metrics(&mut self) -> Result<()> {
-        if self.prof_watched {
-            return Ok(());
-        }
-
-        // For profiling metrics, we need to set up proper watching
-        // This likely requires root permissions
-        let dcgm_field_group_create: Symbol<
-            unsafe extern "C" fn(
-                handle: u64,
-                num_field_ids: i32,
-                field_ids: *mut u16,
-                field_group_name: *const i8,
-                field_group_id: *mut u64,
-            ) -> i32,
-        > = unsafe { self.lib.get(b"dcgmFieldGroupCreate")? };
-
-        let field_ids = [crate::dcgm_types::DCGM_FI_PROF_SM_ACTIVE];
-        let pid = std::process::id();
-        let field_group_name = CString::new(format!("ProfMetrics{}", pid)).unwrap();
-        let mut field_group_id: u64 = 0;
-
-        let result = unsafe {
-            dcgm_field_group_create(
-                self.handle,
-                field_ids.len() as i32,
-                field_ids.as_ptr() as *mut u16,
-                field_group_name.as_ptr(),
-                &mut field_group_id,
-            )
-        };
-
-        if result != 0 && result != -26
-        /* DCGM_ST_DUPLICATE_KEY */
-        {
-            return Err(DcgmError::ApiError(
-                result,
-                "dcgmFieldGroupCreate failed for profiling metrics".to_string(),
-            ));
-        }
-
-        self.prof_group_id = field_group_id;
-
-        // Start watching this field group on all GPUs
-        let dcgm_watch_fields: Symbol<
-            unsafe extern "C" fn(
-                handle: u64,
-                group_id: u64,
-                field_group_id: u64,
-                update_freq: i64,
-                max_keep_age: f64,
-                max_keep_samples: i32,
-            ) -> i32,
-        > = unsafe { self.lib.get(b"dcgmWatchFields")? };
-
-        let result = unsafe {
-            dcgm_watch_fields(
-                self.handle,
-                0x7fffffff, // DCGM_GROUP_ALL_GPUS
-                field_group_id,
-                100000, // Update every 100ms
-                0.0,    // No limit on keep age
-                0,      // No limit on keep samples
-            )
-        };
-
-        if result != 0 {
-            if result == -29 {
-                // DCGM_ST_REQUIRES_ROOT
-                return Err(DcgmError::RequiresRoot(
-                    "Profiling metrics require root access. Try running with sudo".to_string(),
-                ));
-            } else {
-                return Err(DcgmError::ApiError(
-                    result,
-                    "dcgmWatchFields failed for profiling metrics".to_string(),
-                ));
-            }
-        }
-
-        self.prof_watched = true;
-        Ok(())
+        Ok(DcgmHandle { handle, lib })
     }
 
     // Force an update of all watched fields
@@ -242,10 +117,6 @@ impl DcgmHandle {
         }
 
         Ok(())
-    }
-
-    pub fn get_handle(&self) -> u64 {
-        self.handle
     }
 
     pub fn get_device_count(&self) -> Result<i32> {
@@ -283,6 +154,93 @@ impl DcgmHandle {
 
         Ok(gpu_ids[0..count as usize].to_vec())
     }
+
+    // Get device name (like "Tesla T4")
+    pub fn get_device_name(&self, device_id: u32) -> Result<String> {
+        use crate::dcgm_types::{DCGM_FE_GPU, DCGM_FI_DEV_NAME, DCGM_FV_FLAG_LIVE_DATA};
+
+        let field_values = self.get_device_field_values(device_id, &[DCGM_FI_DEV_NAME], true)?;
+
+        if field_values.is_empty() {
+            return Err(DcgmError::FieldValueError(
+                "No device name data returned".to_string(),
+            ));
+        }
+
+        let field_value = &field_values[0];
+        let c_str = unsafe { &field_value.value.str };
+
+        // Convert C string to Rust string
+        let mut name = String::new();
+        let mut i = 0;
+        while i < c_str.len() && c_str[i] != 0 {
+            name.push(c_str[i] as u8 as char);
+            i += 1;
+        }
+
+        Ok(name)
+    }
+
+    // Get device field values helper function
+    pub(crate) fn get_device_field_values(
+        &self,
+        device_id: u32,
+        field_ids: &[u16],
+        use_live_data: bool,
+    ) -> Result<Vec<dcgm_types::DcgmFieldValue>> {
+        use crate::dcgm_types::{DcgmFieldValue, DCGM_FE_GPU, DCGM_FV_FLAG_LIVE_DATA};
+
+        let dcgm_entities_get_latest_values: Symbol<
+            unsafe extern "C" fn(
+                handle: u64,
+                entities: *const EntityPair,
+                entity_count: u32,
+                fields: *const u16,
+                field_count: u32,
+                flags: u32,
+                values: *mut DcgmFieldValue,
+            ) -> i32,
+        > = unsafe { self.lib.get(b"dcgmEntitiesGetLatestValues")? };
+
+        let entity = EntityPair {
+            entity_group_id: DCGM_FE_GPU,
+            entity_id: device_id,
+        };
+
+        let field_count = field_ids.len() as u32;
+        let mut values: Vec<DcgmFieldValue> = Vec::with_capacity(field_count as usize);
+        for _ in 0..field_count {
+            values.push(DcgmFieldValue::default());
+        }
+
+        // Flag to request live data if needed
+        let flags: u32 = if use_live_data {
+            DCGM_FV_FLAG_LIVE_DATA
+        } else {
+            0
+        };
+
+        let result = unsafe {
+            dcgm_entities_get_latest_values(
+                self.handle,
+                &entity,
+                1,
+                field_ids.as_ptr(),
+                field_count,
+                flags,
+                values.as_mut_ptr(),
+            )
+        };
+
+        if result != 0 {
+            return Err(DcgmError::ApiError(
+                result,
+                "dcgmEntitiesGetLatestValues failed".to_string(),
+            ));
+        }
+
+        Ok(values)
+    }
 }
 
 impl Drop for DcgmHandle {
@@ -290,37 +248,7 @@ impl Drop for DcgmHandle {
         if self.handle != 0 {
             // Try to clean up
             unsafe {
-                // First try to stop watching any fields if we created field groups
-                if self.power_group_id != 0 || self.prof_group_id != 0 {
-                    if let Ok(dcgm_unwatch_fields) =
-                        self.lib
-                            .get::<unsafe extern "C" fn(u64, u64, u64) -> i32>(b"dcgmUnwatchFields")
-                    {
-                        if self.power_group_id != 0 {
-                            let _ =
-                                dcgm_unwatch_fields(self.handle, 0x7fffffff, self.power_group_id);
-                        }
-                        if self.prof_group_id != 0 {
-                            let _ =
-                                dcgm_unwatch_fields(self.handle, 0x7fffffff, self.prof_group_id);
-                        }
-                    }
-                }
-
-                // Then destroy field groups
-                if let Ok(dcgm_field_group_destroy) = self
-                    .lib
-                    .get::<unsafe extern "C" fn(u64, u64) -> i32>(b"dcgmFieldGroupDestroy")
-                {
-                    if self.power_group_id != 0 {
-                        let _ = dcgm_field_group_destroy(self.handle, self.power_group_id);
-                    }
-                    if self.prof_group_id != 0 {
-                        let _ = dcgm_field_group_destroy(self.handle, self.prof_group_id);
-                    }
-                }
-
-                // Then stop embedded mode if we're in it
+                // Stop embedded mode if we're in it
                 if let Ok(dcgm_stop_embedded) = self
                     .lib
                     .get::<unsafe extern "C" fn(u64) -> i32>(b"dcgmStopEmbedded")
@@ -338,4 +266,10 @@ impl Drop for DcgmHandle {
             }
         }
     }
+}
+
+#[repr(C)]
+struct EntityPair {
+    pub entity_group_id: u32,
+    pub entity_id: u32,
 }

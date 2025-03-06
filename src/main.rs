@@ -3,10 +3,19 @@ use std::{thread, time::Duration};
 
 fn main() {
     // Create a new DCGM handle (embedded mode)
-    let mut dcgm = match DcgmHandle::new() {
+    // let dcgm = match DcgmHandle::new() {
+    //     Ok(handle) => handle,
+    //     Err(e) => {
+    //         eprintln!("Failed to initialize DCGM: {}", e);
+    //         return;
+    //     }
+    // };
+
+    // Connect to local nv-hostengine at port 5555
+    let dcgm = match DcgmHandle::with_connection("localhost", Some(5555)) {
         Ok(handle) => handle,
         Err(e) => {
-            eprintln!("Failed to initialize DCGM: {}", e);
+            eprintln!("Failed to connect to DCGM: {}", e);
             return;
         }
     };
@@ -22,76 +31,97 @@ fn main() {
 
     println!("Found {} GPUs", gpu_ids.len());
 
-    // Enable watches for our metrics
-    if let Err(e) = dcgm.enable_power_metrics() {
-        eprintln!("Warning: Failed to enable power metrics: {}", e);
+    // Print GPU names
+    for &gpu_id in &gpu_ids {
+        match dcgm.get_device_name(gpu_id) {
+            Ok(name) => println!("GPU {}: {}", gpu_id, name),
+            Err(e) => eprintln!("Failed to get name for GPU {}: {}", gpu_id, e),
+        }
     }
 
-    // Try to enable profiling metrics, but handle the case where it requires root
-    let profiling_enabled = match dcgm.enable_profiling_metrics() {
-        Ok(_) => true,
-        Err(e) => {
-            eprintln!("Warning: Failed to enable profiling metrics: {}", e);
+    println!("\nMonitoring GPU metrics (press Ctrl+C to stop):");
 
-            match e {
-                DcgmError::RequiresRoot(_) => {
-                    println!("Note: Profiling metrics require root access. Only power usage will be shown.");
-                    println!("Try running with 'sudo' to access SM activity metrics.");
-                    false
-                }
-                _ => false,
-            }
-        }
-    };
-
-    // Wait a moment for metrics to initialize
-    thread::sleep(Duration::from_millis(500));
-
-    // Force an update before we start monitoring
-    if let Err(e) = dcgm.update_all_fields(true) {
-        eprintln!("Warning: Failed to update fields: {}", e);
-    }
-
-    // Monitor power usage and SM activity for each GPU
-    for _ in 0..10 {
-        // Force an update to get fresh data
-        if let Err(e) = dcgm.update_all_fields(true) {
-            eprintln!("Warning: Failed to update fields: {}", e);
-        }
+    // Continuously monitor all metrics for 10 measurements
+    for i in 1..=10 {
+        println!("\nMeasurement #{}", i);
 
         for &gpu_id in &gpu_ids {
-            // If profiling metrics aren't available, just show power usage
-            if !profiling_enabled {
-                match dcgm.get_power_usage(gpu_id) {
-                    Ok(power) => {
-                        println!(
-                            "GPU {}: Power usage: {:.2} W (SM Activity: Not available)",
-                            gpu_id, power.power_usage
-                        );
+            match dcgm.get_basic_metrics(gpu_id) {
+                Ok(metrics) => {
+                    print!("GPU {} - ", gpu_id);
+
+                    // Power metrics
+                    if let Some(power) = metrics.power_usage {
+                        print!("Power: {:.2} W, ", power);
                     }
-                    Err(e) => {
-                        eprintln!("Failed to get power usage for GPU {}: {}", gpu_id, e);
+
+                    // Temperature
+                    if let Some(temp) = metrics.gpu_temp {
+                        print!("Temp: {}°C", temp);
+                        if let Some(max_temp) = metrics.max_gpu_temp {
+                            print!("/{}°C max, ", max_temp);
+                        } else {
+                            print!(", ");
+                        }
+                    }
+
+                    // Memory
+                    if let Some(used) = metrics.fb_used {
+                        if let Some(total) = metrics.fb_total {
+                            print!(
+                                "Mem: {}/{} MB ({:.1}%), ",
+                                used,
+                                total,
+                                (used as f64 / total as f64) * 100.0
+                            );
+                        } else {
+                            print!("Mem: {} MB, ", used);
+                        }
+                    }
+
+                    // Utilization
+                    if let Some(util) = metrics.gpu_util {
+                        print!("Util: {}%, ", util);
+                    }
+
+                    // Clocks
+                    if let Some(sm_clock) = metrics.sm_clock {
+                        print!("SM: {} MHz, ", sm_clock);
+                    }
+
+                    if let Some(mem_clock) = metrics.mem_clock {
+                        print!("Mem: {} MHz, ", mem_clock);
+                    }
+
+                    // Throttling reasons
+                    if let Some(reasons) = &metrics.throttle_reasons {
+                        if !reasons.is_empty() {
+                            print!("Throttle: {}", reasons.join(", "));
+                        }
+                    }
+
+                    println!();
+
+                    // Print violations if they exist
+                    if let Some(power_violation) = metrics.power_violation_time {
+                        if power_violation > 0 {
+                            println!("  Power violations: {} μs", power_violation);
+                        }
+                    }
+
+                    if let Some(thermal_violation) = metrics.thermal_violation_time {
+                        if thermal_violation > 0 {
+                            println!("  Thermal violations: {} μs", thermal_violation);
+                        }
                     }
                 }
-            } else {
-                // If profiling is enabled, try to get both metrics
-                match dcgm.get_metrics(gpu_id) {
-                    Ok((power, sm_activity)) => {
-                        println!(
-                            "GPU {}: Power usage: {:.2} W, SM Activity: {:.2}%",
-                            gpu_id,
-                            power.power_usage,
-                            sm_activity.sm_active * 100.0
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to get metrics for GPU {}: {}", gpu_id, e);
-                    }
+                Err(e) => {
+                    eprintln!("Failed to get metrics for GPU {}: {}", gpu_id, e);
                 }
             }
         }
 
-        // Wait a second before the next measurement
+        // Wait before next measurement
         thread::sleep(Duration::from_secs(1));
     }
 }
